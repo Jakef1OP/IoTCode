@@ -1,0 +1,174 @@
+/*
+This program:
+ - connects to a LoRaWAN by ABP/MANUAL
+ - reads light data from an analogue Light Dependent Resistor
+ - reads temperaure and humidity from a DHT22 sensor
+ - sends the recorded data onto the LoRaWAN
+ - sets the mDot to sleep
+ - repeats these operations in a loop
+*/
+
+#include "mbed.h"
+#include "mDot.h"
+#include "ChannelPlans.h"
+#include "MTSLog.h"
+#include "dot_util.h"
+#include "mbed.h"
+#include "DHT22.h"
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <sstream>
+ 
+ //dht 22 pin (D6 on UDK 2)
+ DHT22 dht22(PA_1);
+
+// these options must match the settings on your Conduit
+/*
+Current test settings
+dev address: 064ac45b
+net sess key: 5526fe0a28a974eb070f7b450433c35c
+app sess key: f42ea6890802d8f2c3e9d0d9f37c80a6
+*/
+//device address
+static uint8_t network_address[] = { 0x06, 0x4a, 0xc4, 0x5b };
+//network session key
+static uint8_t network_session_key[] = { 0x55, 0x26, 0xfe, 0x0a, 0x28, 0xa9, 0x74, 0xeb, 0x07, 0x0f, 0x7b, 0x45, 0x04, 0x33, 0xc3, 0x5c };
+//application sesssion or data session key
+static uint8_t data_session_key[] = { 0xf4, 0x2e, 0xa6, 0x89, 0x08, 0x02, 0xd8, 0xf2, 0xc3, 0xe9, 0xd0, 0xd9, 0xf3, 0x7c, 0x80, 0xa6 };
+static uint8_t frequency_sub_band = 2; //VFI
+static bool public_network = true;
+//enable receipt of ackknowledge packets 0 = No, 1 = Yes
+static uint8_t ack = 0;
+//adaptive data rate enabler
+static bool adr = false;
+
+//USB serial 
+Serial pc(USBTX, USBRX);
+
+//get ourselves an mDot pointer - we will assign to it in main()
+mDot* dot = NULL;
+
+//converts value to string
+template <typename T>
+string ToString(T val) {
+    stringstream stream;
+    stream << val;
+    return stream.str();
+}
+
+int main() 
+{
+    //setting serial rate
+    pc.baud(9600);
+    
+    // use AU915 plan
+    lora::ChannelPlan* plan = new lora::ChannelPlan_AU915();
+    assert(plan);
+    // get a mDot handle with the plan we chose
+    dot = mDot::getInstance(plan);
+    assert(dot); 
+    
+    if (!dot->getStandbyFlag()) {
+        logInfo("mbed-os library version: %d", MBED_LIBRARY_VERSION);
+
+        // start from a well-known state
+        logInfo("defaulting Dot configuration");
+        dot->resetConfig();
+        dot->resetNetworkSession();
+
+        // make sure library logging is turned on
+        dot->setLogLevel(mts::MTSLog::DEBUG_LEVEL);
+
+        // update configuration if necessary
+        if (dot->getJoinMode() != mDot::MANUAL) {
+            logInfo("changing network join mode to MANUAL");
+            if (dot->setJoinMode(mDot::MANUAL) != mDot::MDOT_OK) {
+                logError("failed to set network join mode to MANUAL");
+            }
+        }
+        // in MANUAL join mode there is no join request/response transaction
+        // as long as the Dot is configured correctly and provisioned correctly on the gateway, it should be able to communicate
+        // network address - 4 bytes (00000001 - FFFFFFFE)
+        // network session key - 16 bytes
+        // data session key - 16 bytes
+        // to provision your Dot with a Conduit gateway, follow the following steps
+        //   * ssh into the Conduit
+        //   * provision the Dot using the lora-query application: http://www.multitech.net/developer/software/lora/lora-network-server/
+        //      lora-query -a 01020304 A 0102030401020304 <your Dot's device ID> 01020304010203040102030401020304 01020304010203040102030401020304
+        //   * if you change the network address, network session key, or data session key, make sure you update them on the gateway
+        // to provision your Dot with a 3rd party gateway, see the gateway or network provider documentation
+        update_manual_config(network_address, network_session_key, data_session_key, frequency_sub_band, public_network, ack);
+
+
+        // enable or disable Adaptive Data Rate
+        dot->setAdr(adr);
+        
+        //* AU915 Datarates
+        //* ---------------
+        //* DR0 - SF10BW125 -- 11 bytes
+        //* DR1 - SF9BW125 -- 53 bytes
+        //* DR2 - SF8BW125 -- 129 byte
+        //* DR3 - SF7BW125 -- 242 bytes
+        //* DR4 - SF8BW500 -- 242 bytes
+        dot->setTxDataRate(mDot::DR2);
+        
+        // save changes to configuration
+        logInfo("saving configuration");
+        if (!dot->saveConfig()) {
+            logError("failed to save configuration");
+        }
+
+        // display configuration
+        display_config();
+    } else {
+        // restore the saved session if the dot woke from deepsleep mode
+        // useful to use with deepsleep because session info is otherwise lost when the dot enters deepsleep
+        logInfo("restoring network session from NVM");
+        dot->restoreNetworkSession();
+    }
+    
+    //this is where the magic happens
+    while (true) {
+    
+        //wake up
+        wait(5);
+		
+        //init data variable
+        std::vector<uint8_t> data;
+        
+        //read DHT22
+		logInfo("Staring DHT22 Readings:");
+        //get dht22 sample
+        int error = dht22.sample();
+        //sampling is a little slow - give it time
+        wait_ms(100);
+        //it's required to divide these values by ten for some reason
+        float h = (float)dht22.getHumidity() / 10;
+        float t = (float)dht22.getTemperature() / 10;
+    
+        //build our output string now
+        string h_str = ToString(h);
+        string t_str = ToString(t);
+        string output = "H:" + h_str + " T:" + t_str;   
+        
+    
+        //serial output for debugging
+        logInfo("Sending %s", output.c_str());
+        
+        // format data for sending to the gateway
+        for (std::string::iterator it = output.begin(); it != output.end(); it++)
+            data.push_back((uint8_t) *it);
+    
+        //now send
+        send_data(data);
+        logInfo("Data sent!");
+
+        // go to sleep and wake up automatically sleep_time seconds later 
+        uint32_t sleep_time = 20;
+        //false is "don't deep sleep" - mDot doesn't do that 
+        dot->sleep(sleep_time, mDot::RTC_ALARM, false);
+    }
+ 
+    return 0; //shouldn't happen
+}
